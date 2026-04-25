@@ -1,58 +1,74 @@
 #!/bin/bash
 set -e
 
-# 1. CONFIG LADEN
+# --- 1. INITIALISIERUNG ---
 CONFIG_FILE=${1:-"backup.conf"}
-[ -f "$CONFIG_FILE" ] || { echo "Config $CONFIG_FILE fehlt!"; exit 1; }
+[ -f "$CONFIG_FILE" ] || { echo "Fehler: $CONFIG_FILE nicht gefunden!"; exit 1; }
 source "$CONFIG_FILE"
 
-# 2. VARIABLEN & LOGGING (Saubere Pfade!)
 TODAY=$(date +%Y-%m-%d)
-DATE_TIME=$(date +"%Y-%m-%d_%H-%M")
-# Neuer Standard-Pfad: /mnt/backup/NAME/ZEITSTEMPEL
-TARGET_ROOT="/mnt/backup/$BACKUP_NAME"
-TARGET_DIR="$TARGET_ROOT/$DATE_TIME"
-MARKER_FILE="$TARGET_ROOT/.done_$TODAY"
+TIMESTAMP=$(date +"%Y-%m-%d_%H-%M")
+TARGET_ROOT="${LOCAL_BACKUP_ROOT:-/mnt/backup}/$BACKUP_NAME"
+TARGET_DIR="$TARGET_ROOT/$TIMESTAMP"
 
 log_msg() {
-    logger -t "BACKUP_$BACKUP_NAME" "[$1] $2"
-    echo "[$1] $2"
+    logger -t "BACKUP_FRAMEWORK" "[$BACKUP_NAME] $1"
+    echo "[$BACKUP_NAME] $1"
 }
 
-# 3. PRÜFUNGEN
-[ -f "$MARKER_FILE" ] && { log_msg "OK" "Heute bereits erledigt."; exit 0; }
+# --- 2. VALIDIERUNG & PRÜFUNG ---
+[ -z "$BACKUP_NAME" ] && { echo "BACKUP_NAME fehlt!"; exit 1; }
+[ -f "$TARGET_ROOT/.done_$TODAY" ] && { log_msg "INFO: Heute bereits erledigt."; exit 0; }
 mkdir -p "$TARGET_DIR"
 
-# 4. ABLAUF
-log_msg "INFO" "Start Backup: $BACKUP_NAME"
+# --- 3. PRE-PROCESSING (Vorbereitung) ---
+log_msg "START: Backup-Prozess läuft..."
 
-# A: Vorbereitung (Stop/Maintenance)
-[[ -n "$STOP_SERVICE" ]] && ssh $NAS_USER@$NAS_IP "sudo systemctl stop $STOP_SERVICE"
-[[ "$NEXTCLOUD_MODE" == "true" ]] && ssh $NAS_USER@$NAS_IP "sudo -u www-data php $NC_PATH/occ maintenance:mode --on"
-
-# B: DB Dump
-if [[ -n "$DB_NAME" ]]; then
-    ssh $NAS_USER@$NAS_IP "mysqldump -u $DB_USER -p$DB_PASS $DB_NAME > /tmp/db.sql"
-    scp $NAS_USER@$NAS_IP:/tmp/db.sql "$TARGET_DIR/db.sql"
-    ssh $NAS_USER@$NAS_IP "rm /tmp/db.sql"
+# Generischer Service-Stop
+if [[ -n "$PRE_STOP_SERVICE" ]]; then
+    log_msg "PRE: Stoppe Dienst $PRE_STOP_SERVICE..."
+    ssh "$NAS_USER@$NAS_IP" "sudo systemctl stop $PRE_STOP_SERVICE"
 fi
 
-# C: Rsync (LB3 Punkt c: Schleife über Array)
+# Generischer App-Befehl (z.B. Nextcloud Maintenance Mode)
+if [[ -n "$PRE_APP_COMMAND" ]]; then
+    log_msg "PRE: Führe App-Befehl aus..."
+    ssh "$NAS_USER@$NAS_IP" "$PRE_APP_COMMAND"
+fi
+
+# Generischer Datenbank-Export
+if [[ -n "$DB_NAME" ]]; then
+    log_msg "PRE: Exportiere Datenbank $DB_NAME..."
+    ssh "$NAS_USER@$NAS_IP" "mysqldump -u $DB_USER -p$DB_PASS $DB_NAME > /tmp/db_dump.sql"
+    scp "$NAS_USER@$NAS_IP:/tmp/db_dump.sql" "$TARGET_DIR/database.sql"
+    ssh "$NAS_USER@$NAS_IP" "rm /tmp/db_dump.sql"
+fi
+
+# --- 4. SYNC (Datenübertragung) ---
 for dir in "${SOURCE_DIRS[@]}"; do
-    rsync -avz -e ssh --rsync-path="sudo rsync" $NAS_USER@$NAS_IP:$dir "$TARGET_DIR/"
+    log_msg "SYNC: Kopiere $dir..."
+    rsync -avz -e ssh --rsync-path="sudo rsync" "$NAS_USER@$NAS_IP:$dir" "$TARGET_DIR/"
 done
 
-# D: Nachbereitung (Start/Maintenance off)
-[[ -n "$STOP_SERVICE" ]] && ssh $NAS_USER@$NAS_IP "sudo systemctl start $STOP_SERVICE"
-[[ "$NEXTCLOUD_MODE" == "true" ]] && ssh $NAS_USER@$NAS_IP "sudo -u www-data php $NC_PATH/occ maintenance:mode --off"
+# --- 5. POST-PROCESSING (Aufräumen/Starten) ---
 
-# E: ROTATION (Löscht alte Backups)
-# Zählt Ordner im Verzeichnis. Wenn mehr als ROTATION_COUNT, lösche die ältesten.
+# Generischer App-Befehl (z.B. Maintenance OFF)
+if [[ -n "$POST_APP_COMMAND" ]]; then
+    log_msg "POST: Führe App-Befehl aus..."
+    ssh "$NAS_USER@$NAS_IP" "$POST_APP_COMMAND"
+fi
+
+# Generischer Service-Start
+if [[ -n "$POST_START_SERVICE" ]]; then
+    log_msg "POST: Starte Dienst $POST_START_SERVICE..."
+    ssh "$NAS_USER@$NAS_IP" "sudo systemctl start $POST_START_SERVICE"
+fi
+
+# --- 6. ROTATION ---
 if [[ -n "$ROTATION_COUNT" ]]; then
-    log_msg "INFO" "Prüfe Rotation (Behalte $ROTATION_COUNT)..."
-    # Listet nur Verzeichnisse auf, sortiert nach Zeit, schneidet die neuesten X ab
+    log_msg "CLEANUP: Behalte $ROTATION_COUNT Backups..."
     ls -1dt "$TARGET_ROOT"/*/ 2>/dev/null | tail -n +$((ROTATION_COUNT + 1)) | xargs rm -rf || true
 fi
 
-touch "$MARKER_FILE"
-log_msg "OK" "Backup $BACKUP_NAME abgeschlossen."
+touch "$TARGET_ROOT/.done_$TODAY"
+log_msg "OK: Backup erfolgreich abgeschlossen."
